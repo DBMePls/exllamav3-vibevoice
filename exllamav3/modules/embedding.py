@@ -37,6 +37,10 @@ class Embedding(Module):
         })
 
     @override
+    def optimizer_targets(self):
+        return []
+
+    @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
         weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True)
@@ -119,7 +123,7 @@ class Embedding(Module):
                 x *= x.shape[-1] ** 0.5
             return x
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         return []
 
     def tp_export(self, plan, producer):

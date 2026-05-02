@@ -31,6 +31,10 @@ class LayerNorm(Module):
         self._numel = None
 
     @override
+    def optimizer_targets(self):
+        return []
+
+    @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
         weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True)
@@ -101,7 +105,7 @@ class LayerNorm(Module):
                 x += b
         return x.to(out_dtype or self.out_dtype)
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         stc = self.config.stc
         storage = sum(stc.get_tensor_sizes(self.key))
         overhead = storage // 2 * (self.out_dtype or torch.half).itemsize
@@ -122,7 +126,7 @@ class LayerNorm(Module):
                 "out_dtype": self.out_dtype,
             },
             "weight": producer.send(self.weight),
-            "bias": self.bias,
+            "bias": producer.send(self.bias),
             "device": self.device,
         }
 

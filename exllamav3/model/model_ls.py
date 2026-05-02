@@ -192,6 +192,7 @@ class Model_LSMixin:
             x = module.forward(x, params)
             if idx == last_kv_module_idx:
                 break
+        del params["prefill"]
         return None
 
 
@@ -202,26 +203,34 @@ class Model_LSMixin:
         last_kv_module_idx: int,
         modules: list,
         is_embeds: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        last_hidden_state = None               
-            
-        for idx, module in enumerate(modules):
-            # If using inputs_embeds, x starts as the embedding tensor.
-            # We must skip the forward pass for the first module (the embedding lookup).          
-            if idx == 0 and is_embeds:                          
-                pass  # x is already the embeddings, so we do nothing
-            else:                
-                if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
-                    x = x[..., -num:, :].contiguous()                
-                
-                x = module.prepare_for_device(x, params)           
-                x = module.forward(x, params)  
+    ):
+        """
+        Minimal extension to support precomputed embeddings (vibevoice):
+        - Skip first module if is_embeds=True (embedding lookup already done)
+        - Capture last_hidden_state after last_kv_module_idx + 1
+        - Return (logits, last_hidden_state) when using embeddings
+        """
+        last_hidden_state = None
 
-            # After the last transformer block (indexed by last_kv_module_idx),
-            # the tensor `x` is the last_hidden_state we need to capture.
+        for idx, module in enumerate(modules):
+            # Skip embedding lookup if embeddings provided
+            if idx == 0 and is_embeds:
+                pass
+            else:
+                if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
+                    x = x[..., -num:, :].contiguous()
+                x = module.prepare_for_device(x, params)
+                x = module.forward(x, params)
+
+            # Capture after the transformer stack, per fork\u2019s correct design
             if idx == last_kv_module_idx + 1:
-                last_hidden_state = x                
+                last_hidden_state = x
 
         logits = x
-        
-        return logits, last_hidden_state
+        return (logits, last_hidden_state) if is_embeds else logits
+
+
+
+
+
+

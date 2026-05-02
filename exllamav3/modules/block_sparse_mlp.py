@@ -162,6 +162,7 @@ class BlockSparseMLP(Module):
         key_gate: str | None = None,
         key_down: str | None = None,
         key_routing_gate: str | None = None,
+        key_shared_gate: str | None = None,
         key_e_score_bias: str | None = "gate.e_score_correction_bias",
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
@@ -169,6 +170,7 @@ class BlockSparseMLP(Module):
         interm_dtype: torch.dtype = None,
         router_type: str = "std",
         routing_gate: Linear | None = None,
+        shared_gate: Linear | None = None,
         routed_scaling_factor: float | None = None,
         n_group: int | None = None,
         topk_group: int | None = None,
@@ -188,6 +190,7 @@ class BlockSparseMLP(Module):
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
+        self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 32)
         self.num_local_experts = num_local_experts if num_local_experts is not None else num_experts
         self.hidden_size = hidden_size
         self.router_type = router_type
@@ -216,6 +219,23 @@ class BlockSparseMLP(Module):
         else:
             self.routing_gate = routing_gate
             self.register_submodule(self.routing_gate)
+
+        if shared_gate is None and key_shared_gate is None:
+            self.shared_gate = None
+        elif shared_gate is None:
+            self.shared_gate = Linear(
+                config = config,
+                key = f"{key}.{key_shared_gate}",
+                in_features = hidden_size,
+                out_features = 1,
+                qmap = None,
+                out_dtype = torch.float,
+                pad_to = 1,
+            )
+            self.register_submodule(self.shared_gate)
+        else:
+            self.shared_gate = shared_gate
+            self.register_submodule(self.shared_gate)
 
         if gates is not None:
             assert ups is not None and len(ups) == len(gates)
@@ -293,6 +313,22 @@ class BlockSparseMLP(Module):
 
         self.tp_reduce = False
 
+        self.bc = None
+        self.bc_sh_exp = False
+
+
+    @override
+    def optimizer_targets(self):
+        g, u, d = [], [], []
+        for m in self.gates: g += m.optimizer_targets()
+        for m in self.ups: u += m.optimizer_targets()
+        for m in self.downs: d += m.optimizer_targets()
+        if self.shared_experts:
+            s = self.shared_experts.optimizer_targets()
+            return [s, [g + u, d]]
+        else:
+            return [[g + u, d]]
+
 
     def load_local(self, **kwargs):
 
@@ -345,6 +381,58 @@ class BlockSparseMLP(Module):
             max_expert = maxe,
         )
 
+        cfg = self.experts_cfg
+        if self.is_quantized:
+
+            sh_exp = None
+            sh_exp_t = None
+            sh_gate = None
+            sh_gate_t = None
+            self.bc_sh_exp = False
+            if self.shared_experts and isinstance(self.shared_experts, GatedMLP) and self.shared_experts.bc is not None:
+                self.bc_sh_exp = True
+                sh_exp = self.shared_experts.bc
+                sh_exp_t = torch.empty_like(cfg.out_d)
+                if self.shared_gate:
+                    assert self.shared_gate.quant_type == "fp16"
+                    sh_gate = self.shared_gate.inner.bc
+                    sh_gate_t = torch.empty((1, 1, 1), dtype = self.shared_gate.out_dtype, device = self.device)
+
+            self.bc = ext.BC_BlockSparseMLP(
+                cfg.yh,
+                cfg.interm_g,
+                cfg.interm_u,
+                cfg.interm_a,
+                cfg.out_d,
+                sh_exp_t,
+                sh_gate_t,
+                cfg.min_expert,
+                cfg.max_expert,
+                self.multi_gate.ptrs_trellis,
+                self.multi_gate.ptrs_suh,
+                self.multi_gate.ptrs_svh,
+                self.multi_gate.K,
+                self.multi_gate.mcg_mult,
+                self.multi_gate.mul1_mult,
+                self.multi_up.ptrs_trellis,
+                self.multi_up.ptrs_suh,
+                self.multi_up.ptrs_svh,
+                self.multi_up.K,
+                self.multi_up.mcg_mult,
+                self.multi_up.mul1_mult,
+                self.multi_down.ptrs_trellis,
+                self.multi_down.ptrs_suh,
+                self.multi_down.ptrs_svh,
+                self.multi_down.K,
+                self.multi_down.mcg_mult,
+                self.multi_down.mul1_mult,
+                self.activation_fn == "silu",
+                self.activation_fn == "gelu",
+                sh_exp,
+                sh_gate
+            )
+
+
     def load_routing(self, **kwargs):
 
         router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
@@ -381,6 +469,7 @@ class BlockSparseMLP(Module):
 
     @override
     def unload(self):
+        self.bc = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
             self.multi_gate = None
@@ -406,6 +495,7 @@ class BlockSparseMLP(Module):
 
         y = x.view(-1, self.hidden_size)
         bsz = y.shape[0]
+        bc_sh_exp = False
 
         # Routing
         if self.routing_gate is not None:
@@ -419,11 +509,15 @@ class BlockSparseMLP(Module):
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
 
+        # Empty slice
+        if self.intermediate_size == 0 or self.num_local_experts == 0:
+            final_hidden_states = torch.zeros_like(x, dtype = self.out_dtype)
+
         # Torch path
-        if bsz > 1 or not self.is_quantized:
+        elif bsz >= self.f_threshold or not self.is_quantized:
             final_hidden_states = torch.zeros_like(y, dtype = self.out_dtype)
 
-            if self.routing_device is None:
+            if self.routing_device is None or self.num_local_experts == self.num_experts:
                 expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes = self.num_local_experts)
             else:
                 # TODO: profile, maybe optimize
@@ -458,11 +552,101 @@ class BlockSparseMLP(Module):
             final_hidden_states = to2(final_hidden_states, out_dtype, self.out_dtype)
 
         # Fused path
-        # TODO: Find good solution for 1 < bsz < 32
+        elif bsz > 1:
+
+            final_hidden_states = torch.empty_like(y, dtype = self.out_dtype)
+
+            y = y.unsqueeze(1).unsqueeze(1)
+            selected_experts = selected_experts.unsqueeze(1)
+            routing_weights = routing_weights.unsqueeze(1)
+
+            # yh = torch.empty((bsz, self.num_experts_per_tok, 1, self.hidden_size), dtype = torch.half, device = self.device)
+            # interm_g = torch.empty((bsz, self.num_experts_per_tok, 1, self.intermediate_size), dtype = self.interm_dtype, device = self.device)
+            # interm_u = torch.empty_like(interm_g)
+            # interm_a = torch.empty_like(interm_u, dtype = torch.half) if self.interm_dtype != torch.half else interm_u
+            # out_d = torch.empty((bsz, self.num_experts_per_tok, 1, self.hidden_size), dtype = self.out_dtype or torch.half, device = self.device)
+
+            cfg = self.experts_cfg
+
+            mine, maxe = self.routing_first, self.routing_last
+            if mine is None or maxe - mine == self.num_experts:
+                mine, maxe = -1, -1
+
+            for i in range(bsz):
+
+                # Gate
+                ext.exl3_mgemm(
+                    y[i],
+                    self.multi_gate.ptrs_trellis,
+                    cfg.interm_g,
+                    self.multi_gate.ptrs_suh,
+                    cfg.yh,
+                    self.multi_gate.ptrs_svh,
+                    selected_experts[i],
+                    None,
+                    self.multi_gate.K,
+                    -1,
+                    self.multi_gate.mcg_mult,
+                    self.multi_gate.mul1_mult,
+                    mine,
+                    maxe,
+                    0
+                )
+
+                # Up
+                ext.exl3_mgemm(
+                    y[i],
+                    self.multi_up.ptrs_trellis,
+                    cfg.interm_u,
+                    self.multi_up.ptrs_suh,
+                    cfg.yh,
+                    self.multi_up.ptrs_svh,
+                    selected_experts[i],
+                    None,
+                    self.multi_up.K,
+                    -1,
+                    self.multi_up.mcg_mult,
+                    self.multi_up.mul1_mult,
+                    mine,
+                    maxe,
+                    0
+                )
+
+                # Activation
+                self.activation_fn_call(cfg.interm_g, cfg.interm_u, cfg.interm_a)
+
+                # Down
+                ext.exl3_mgemm(
+                    cfg.interm_a,
+                    self.multi_down.ptrs_trellis,
+                    cfg.out_d,
+                    self.multi_down.ptrs_suh,
+                    cfg.interm_a,
+                    self.multi_down.ptrs_svh,
+                    selected_experts[i],
+                    routing_weights[i],
+                    self.multi_down.K,
+                    -1,
+                    self.multi_down.mcg_mult,
+                    self.multi_down.mul1_mult,
+                    mine,
+                    maxe,
+                    0
+                )
+
+                t = cfg.out_d[0]
+                final_hidden_states[i:i+1] = t
+
+            final_hidden_states = final_hidden_states.view(x.shape)
+
+        # Bsz 1
+        elif self.bc is not None:
+            self.bc.run_bsz1(y, selected_experts, routing_weights)
+            final_hidden_states = self.experts_cfg.out_d[:1, ...].view(x.shape)
+            bc_sh_exp = self.bc_sh_exp
+
         else:
-
             y = y.unsqueeze(0)
-
             cfg = self.experts_cfg
 
             # Gate
@@ -480,7 +664,8 @@ class BlockSparseMLP(Module):
                 self.multi_gate.mcg_mult,
                 self.multi_gate.mul1_mult,
                 cfg.min_expert,
-                cfg.max_expert
+                cfg.max_expert,
+                0
             )
 
             # Up
@@ -498,7 +683,8 @@ class BlockSparseMLP(Module):
                 self.multi_up.mcg_mult,
                 self.multi_up.mul1_mult,
                 cfg.min_expert,
-                cfg.max_expert
+                cfg.max_expert,
+                0
             )
 
             # Activation
@@ -519,18 +705,27 @@ class BlockSparseMLP(Module):
                 self.multi_down.mcg_mult,
                 self.multi_down.mul1_mult,
                 cfg.min_expert,
-                cfg.max_expert
+                cfg.max_expert,
+                0
             )
 
             final_hidden_states = cfg.out_d[:1, ...].view(x.shape)
 
         # Shared experts
-        if self.shared_experts:
-            final_hidden_states += self.shared_experts.forward(x, params)
+        if self.shared_experts and not bc_sh_exp:
+            y = self.shared_experts.forward(x, params)
+            if self.shared_gate:
+                z = self.shared_gate.forward(x, params)
+                ext.add_sigmoid_gate(y, z, final_hidden_states)
+            else:
+                final_hidden_states += y
 
         # Output reduction
         if self.tp_reduce:
-            params["backend"].all_reduce(final_hidden_states, self.num_local_experts > 0 or bool(self.shared_experts))
+            params["backend"].all_reduce(
+                final_hidden_states,
+                (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
+            )
 
         return final_hidden_states
 
@@ -543,7 +738,7 @@ class BlockSparseMLP(Module):
         return t
 
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         storage += self.routing_gate.storage_size()
         for g in self.gates: storage += g.storage_size()
@@ -559,21 +754,22 @@ class BlockSparseMLP(Module):
             self.ups[0].recons_size(),
             self.downs[0].recons_size()
         )
+        use_tp_split = options.get("moe_tensor_split", False)
         tpa = TPAllocation(
             key = self.key,
-            channel_width = 1,
-            channel_unit = "experts",
+            channel_width = 128 if use_tp_split else 1,
+            channel_unit = "channels" if use_tp_split else "experts",
             storage_per_device = 0,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
             overhead_to_split = overhead_s,
             recons_temp = recons,
-            channels_to_split = self.num_experts,
+            channels_to_split = self.intermediate_size // 128 if use_tp_split else self.num_experts,
             limit_key = "moe"
         )
         tpa_list = [tpa]
         if self.shared_experts:
-            tpa_list += self.shared_experts.make_tp_allocation()
+            tpa_list += self.shared_experts.make_tp_allocation(options)
         return tpa_list
 
 
@@ -617,8 +813,7 @@ class BlockSparseMLP(Module):
         key = exported["kwargs"]["key"]
         device = local_context["device"]
         output_device = local_context["output_device"]
-        first, last = plan[key]
-        num_local_experts = last - first
+        first, last, unit = plan[key]
 
         def _import(name):
             nonlocal exported, plan
@@ -635,23 +830,52 @@ class BlockSparseMLP(Module):
             return exported[name][i]["cls"].tp_import(local_context, exported[name][i], plan) \
                 if exported.get(name) else None
 
+        def _import_i_split(name, i, split):
+            nonlocal exported, plan
+            return exported[name][i]["cls"].tp_import_split(local_context, exported[name][i], plan, split) \
+                if exported.get(name) else None
+
+        # Tensor parallel
+        if unit == "channels":
+            num_local_experts = exported["kwargs"]["num_experts"]
+            gu_split = (True, first, last)
+            d_split = (False, first, last)
+            exported["kwargs"]["intermediate_size"] = last - first
+            gates = [_import_i_split("gates", i, gu_split) for i in range(num_local_experts)]
+            ups = [_import_i_split("ups", i, gu_split) for i in range(num_local_experts)]
+            downs = [_import_i_split("downs", i, d_split) for i in range(num_local_experts)]
+            routing_first = 0
+            routing_last = num_local_experts
+
+        # Expert parallel
+        elif unit == "experts":
+            num_local_experts = last - first
+            gates = [_import_i("gates", i) for i in range(first, last)]
+            ups = [_import_i("ups", i) for i in range(first, last)]
+            downs = [_import_i("downs", i) for i in range(first, last)]
+            routing_first = first
+            routing_last = last
+
+        else:
+            assert False
+
         module = BlockSparseMLP(
             config = None,
             **exported["kwargs"],
             num_local_experts = num_local_experts,
-            gates = [_import_i("gates", i) for i in range(first, last)],
-            ups = [_import_i("ups", i) for i in range(first, last)],
-            downs = [_import_i("downs", i) for i in range(first, last)],
+            gates = gates,
+            ups = ups,
+            downs = downs,
             shared_experts = _import_no_reduce("shared_experts"),
             routing_gate = _import("routing_gate") if device == output_device else None,
-            routing_first = first,
-            routing_last = last,
+            routing_first = routing_first,
+            routing_last = routing_last,
             routing_device = output_device,
         )
 
         module.device = device
         module.e_score_correction_bias = consumer.recv(exported["e_score_correction_bias"], cuda = True)
-        if num_local_experts > 0:
+        if unit == "channels" or num_local_experts > 0:
             module.load_local()
         if module.routing_gate is not None:
             module.load_routing()

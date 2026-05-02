@@ -30,7 +30,7 @@ __device__ inline void ptx_mma_m8n8k4
     float* c = reinterpret_cast<float*>(&frag_c);
     const float* d = reinterpret_cast<const float*>(&frag_c);
 
-    asm volatile
+    asm
     (
         "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%12,%13,%14,%15,%16,%17,%18,%19};\n"
@@ -60,7 +60,7 @@ __device__ inline void ptx_mma_m16n8k16
     float* c = reinterpret_cast<float*>(&frag_c);
     const float* d = reinterpret_cast<const float*>(&frag_c);
 
-    asm volatile
+    asm
     (
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
@@ -85,7 +85,7 @@ __device__ inline void ptx_mma_m16n8k16
     uint32_t* c = reinterpret_cast<uint32_t*>(&frag_c);
     const uint32_t* d = reinterpret_cast<const uint32_t*>(&frag_c);
 
-    asm volatile
+    asm
     (
         "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
         "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%9};\n"
@@ -234,17 +234,6 @@ __device__ inline uint32_t mul_hi_u32(uint32_t x, uint32_t y)
     return w;
 }
 
-static __forceinline__ __device__ uint32_t bfe64(uint32_t lo, uint32_t hi, int offset, int length)
-{
-    uint64_t value = (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo);
-    uint64_t result64;
-    asm volatile ("bfe.u64 %0, %1, %2, %3;"
-                  : "=l"(result64)
-                  : "l"(value), "r"(offset), "r"(length));
-
-    return static_cast<uint32_t>(result64);
-}
-
 // Memory ops
 
 __device__ __forceinline__ void stg_wt_u32(uint32_t* p, uint32_t v)
@@ -308,3 +297,18 @@ __device__ __forceinline__ uint64_t globaltimer_ns()
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
 }
+
+// Bitfield stuff
+
+static __forceinline__ __device__ uint32_t bfe64(uint32_t lo, uint32_t hi, int offset, int length)
+{
+    uint64_t value = (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo);
+    uint64_t result64;
+    asm ("bfe.u64 %0, %1, %2, %3;"
+         : "=l"(result64)
+         : "l"(value), "r"(offset), "r"(length));
+    return static_cast<uint32_t>(result64);
+}
+
+#define FSHF_IMM(dst, lo, hi, imm) asm("shf.r.wrap.b32 %0, %1, %2, " #imm ";" : "=r"(dst) : "r"(lo), "r"(hi))
+#define BFE16_IMM(dst, src, imm) asm("bfe.u32 %0, %1, " #imm ", 16;" : "=r"(dst) : "r"(src))

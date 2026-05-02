@@ -30,6 +30,10 @@ class RMSNorm(Module):
         self.constant_bias = constant_bias
 
     @override
+    def optimizer_targets(self):
+        return []
+
+    @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
         weight = self.config.stc.get_tensor(f"{self.key}.weight", self.device, float2half = True)
@@ -78,7 +82,7 @@ class RMSNorm(Module):
         ext.rms_norm(x, self.weight, y, self.rms_norm_eps, self.constant_bias)
         return y
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         stc = self.config.stc
         storage = sum(stc.get_tensor_sizes(self.key))
         overhead = storage // 2 * (self.out_dtype or torch.half).itemsize

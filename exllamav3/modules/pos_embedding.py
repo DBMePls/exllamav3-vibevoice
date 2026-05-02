@@ -30,6 +30,9 @@ class PosEmbedding(Module):
         self.embedding = None
         self._numel = vocab_size * hidden_size if vocab_size is not None else None
 
+    def optimizer_targets(self):
+        return []
+
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
@@ -76,5 +79,5 @@ class PosEmbedding(Module):
 
         return to2(x, out_dtype, self.out_dtype)
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         return []

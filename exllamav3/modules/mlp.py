@@ -11,6 +11,7 @@ from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
 import torch.distributed as dist
 from .multilinear import MultiLinear
+from ..util.tensor import g_tensor_cache
 
 class MLP(Module):
 
@@ -23,6 +24,10 @@ class MLP(Module):
         out_size: int | None = None,
         key_up: str | None = None,
         key_down: str | None = None,
+        key_alpha_p: str | None = None,
+        key_alpha_n: str | None = None,
+        alpha_p: float | None = None,
+        alpha_n: float | None = None,
         qmap: str | None = None,
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
@@ -123,13 +128,28 @@ class MLP(Module):
                 a = b
 
         self.activation_fn = activation_fn
+        self.key_alpha_p = key_alpha_p
+        self.key_alpha_n = key_alpha_n
+        self.alpha_p = alpha_p
+        self.alpha_n = alpha_n
 
         match activation_fn:
             case "silu": self.activation_fn_call = F.silu
             case "gelu": self.activation_fn_call = lambda x: F.gelu(x, approximate = "tanh")
             case "relu2": self.activation_fn_call = lambda x: torch.square(F.relu(x))
+            case "xielu": self.activation_fn_call = self.act_xielu
 
         self.tp_reduce = False
+
+        self.bc = None
+
+
+    @override
+    def optimizer_targets(self):
+        u, d = [], []
+        for m in self.ups: u += m.optimizer_targets()
+        for m in self.downs: d += m.optimizer_targets()
+        return [[u, d]]
 
 
     @override
@@ -145,6 +165,34 @@ class MLP(Module):
         else:
             self.ups[load_slice].load(device, **kwargs)
             self.downs[load_slice].load(device, **kwargs)
+        if self.key_alpha_p:
+            self.alpha_p = self.config.stc.get_tensor(self.key_alpha_p, None, optional = False, allow_bf16 = True)
+        if self.key_alpha_n:
+            self.alpha_n = self.config.stc.get_tensor(self.key_alpha_n, None, optional = False, allow_bf16 = True)
+
+
+    @override
+    def unload(self):
+        super().unload()
+        self.alpha_p = None
+        self.alpha_n = None
+
+
+    def act_xielu_torch(self, x):
+        alpha_p = nn.functional.softplus(self.alpha_p.float()).item()
+        alpha_n = nn.functional.softplus(self.alpha_n.float()).item() + 0.5
+        eps = torch.tensor([-9.9838e-07], device = x.device)
+        return torch.where(
+            x > 0,
+            alpha_p * x * x + 0.5 * x,
+            (torch.expm1(torch.min(x, eps)) - x) * alpha_n + 0.5 * x,
+        ).half()
+
+
+    def act_xielu(self, x):
+        y = torch.empty_like(x, dtype = torch.half)
+        ext.xielu(x, y, self.alpha_p, self.alpha_n)
+        return y
 
 
     @override
@@ -174,7 +222,17 @@ class MLP(Module):
         return to2(d, out_dtype, self.out_dtype)
 
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    @override
+    def get_tensors(self):
+        t = super().get_tensors()
+        if self.alpha_p is not None:
+            t[self.key_alpha_p] = self.alpha_p
+        if self.alpha_n is not None:
+            t[self.key_alpha_n] = self.alpha_n
+        return t
+
+
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         ims = min(self.intermediate_size, self.intermediate_split_size)
         for u in self.ups: storage += u.storage_size()
@@ -222,6 +280,8 @@ class MLP(Module):
                 "interm_dtype": self.interm_dtype,
                 "intermediate_split_size": self.intermediate_split_size,
             },
+            "alpha_p": producer.send(self.alpha_p),
+            "alpha_n": producer.send(self.alpha_n),
             "ups": [_export(self.ups[i]) for i in range(self.num_slices)],
             "downs": [_export(self.downs[i]) for i in range(self.num_slices)],
             "device": self.device,
@@ -230,9 +290,10 @@ class MLP(Module):
 
     @staticmethod
     def tp_import(local_context, exported, plan, **kwargs):
+        consumer = local_context["consumer"]
         key = exported["kwargs"]["key"]
         device = local_context["device"]
-        first, last = plan[key]
+        first, last, unit = plan[key]
         num_slices = len(exported["ups"])
 
         if first >= last:
@@ -249,6 +310,7 @@ class MLP(Module):
                 if exported.get(name) else None
 
         if num_slices == 1:
+            assert unit == "channels"
             u_split = (True, first, last)
             d_split = (False, first, last)
             module = MLP(
@@ -259,6 +321,7 @@ class MLP(Module):
             )
 
         elif num_slices > 1:
+            assert unit == "slices"
             module = MLP(
                 config = None,
                 **exported["kwargs"],
@@ -275,6 +338,8 @@ class MLP(Module):
             )
 
         module.device = device
+        module.alpha_p = consumer.recv(exported["alpha_p"], cuda = False)
+        module.alpha_n = consumer.recv(exported["alpha_n"], cuda = False)
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
         torch.cuda.synchronize()
@@ -433,6 +498,18 @@ class GatedMLP(Module):
         self.tp_reduce = False
         self.multi_gu: list[MultiLinear | None] = [None] * self.num_slices
 
+        self.bc = None
+        self.bsz1_pa_args = []
+
+
+    @override
+    def optimizer_targets(self):
+        g, u, d = [], [], []
+        for m in self.gates: g += m.optimizer_targets()
+        for m in self.ups: u += m.optimizer_targets()
+        for m in self.downs: d += m.optimizer_targets()
+        return [[g + u, d]]
+
 
     @override
     def can_defer_load(self):
@@ -454,23 +531,49 @@ class GatedMLP(Module):
 
     def load_local(self, device: torch.Device, load_slice: int, **kwargs):
         # Test if gate and up proj can be fused
-        # TODO: Appears to be broken for MLPs using padding on gate/up. Disable until that's sorted out
-        pass
-        # if (
-        #     device != torch.device("cpu") and
-        #     self.gates[load_slice].quant_type == "exl3" and
-        #     self.ups[load_slice].quant_type == "exl3" and
-        #     self.gates[load_slice].out_features == self.ups[load_slice].out_features and
-        #     self.gates[load_slice].inner.K == self.ups[load_slice].inner.K and
-        #     self.gates[load_slice].inner.bias is None and
-        #     self.ups[load_slice].inner.bias is None
-        # ):
-        #     self.multi_gu[load_slice] = MultiLinear(self.device, [self.gates[load_slice], self.ups[load_slice]])
+        if (
+            device != torch.device("cpu") and
+            self.gates[load_slice].quant_type == "exl3" and
+            self.ups[load_slice].quant_type == "exl3" and
+            self.gates[load_slice].out_features == self.ups[load_slice].out_features and
+            self.gates[load_slice].inner.K == self.ups[load_slice].inner.K and
+            self.gates[load_slice].inner.bias is None and
+            self.ups[load_slice].inner.bias is None
+        ):
+            self.multi_gu[load_slice] = MultiLinear(self.device, [self.gates[load_slice], self.ups[load_slice]])
+
+        self.bc = None
+        if self.num_slices == 1 and self.multi_gu[0] is not None and self.downs[0].inner.bc is not None:
+            mgu = self.multi_gu[0]
+            self.bsz1_pa_args = [
+                (device, (2, 1, self.hidden_size), self.interm_dtype),
+                (device, (2, 1, mgu.out_features), self.interm_dtype),
+                (device, (1, 1, 1, mgu.out_features), torch.half)
+            ]
+            self.bc = ext.BC_GatedMLP(
+                *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
+                mgu.ptrs_trellis,
+                mgu.ptrs_suh,
+                mgu.ptrs_svh,
+                mgu.K,
+                mgu.mcg_mult,
+                mgu.mul1_mult,
+                self.activation_fn == "silu",
+                self.activation_fn == "gelu",
+                self.activation_fn == "relu2",
+                self.downs[0].inner.bc,
+            )
 
 
     @override
     def unload(self):
         super().unload()
+
+        if self.bc is not None:
+            for arg in self.bsz1_pa_args:
+                g_tensor_cache.drop(*arg)
+            self.bc = None
+            self.bsz1_pa_args = []
 
         for i in range(self.num_slices):
             if self.multi_gu[i] is not None:
@@ -501,10 +604,22 @@ class GatedMLP(Module):
                 if self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
+                    a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                    self.activation_fn_call(g, u, a)
+                    d_ = self.downs[s].forward(a, params)
+
+                    if d is None: d = d_
+                    else: d += d_
+                    del d_
+
+                elif self.bc is not None and bsz == 1 and q_len == 1:
+                    d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
+                    x = x.view(1, bsz * q_len, dim)
+                    self.bc.run_bsz1(x, d.view(x.shape))
 
                 else:
                     x = x.view(1, bsz * q_len, dim)
-                    guh = torch.empty((2, bsz * q_len, self.multi_gu[s].out_features), dtype = self.interm_dtype, device = x.device)
+                    guh = torch.empty((2, bsz * q_len, dim), dtype = self.interm_dtype, device = x.device)
                     gu = torch.empty((2, bsz * q_len, self.multi_gu[s].out_features), dtype = self.interm_dtype, device = x.device)
                     ext.exl3_mgemm(
                         x,
@@ -520,25 +635,27 @@ class GatedMLP(Module):
                         self.multi_gu[s].mcg_mult,
                         self.multi_gu[s].mul1_mult,
                         -1,
-                        -1
+                        -1,
+                        0
                     )
                     g = gu[0].view(bsz, q_len, self.multi_gu[s].out_features)
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)
 
-                a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
-                self.activation_fn_call(g, u, a)
-                d_ = self.downs[s].forward(a, params)
+                    a = torch.empty_like(u, dtype = torch.half) if self.interm_dtype != torch.half else u
+                    self.activation_fn_call(g, u, a)
+                    d_ = self.downs[s].forward(a, params)
 
-                if d is None: d = d_
-                else: d += d_
-                del d_
+                    if d is None: d = d_
+                    else: d += d_
+                    del d_
+
             if self.tp_reduce:
                 params["backend"].all_reduce(d)
 
         return to2(d, out_dtype, self.out_dtype)
 
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         ims = min(self.intermediate_size, self.intermediate_split_size)
         for g in self.gates: storage += g.storage_size()
@@ -599,7 +716,7 @@ class GatedMLP(Module):
     def tp_import(local_context, exported, plan, **kwargs):
         key = exported["kwargs"]["key"]
         device = local_context["device"]
-        first, last = plan[key]
+        first, last, unit = plan[key]
         num_slices = len(exported["gates"])
 
         if first >= last:
@@ -616,6 +733,7 @@ class GatedMLP(Module):
                 if exported.get(name) else None
 
         if num_slices == 1:
+            assert unit == "channels"
             gu_split = (True, first, last)
             d_split = (False, first, last)
             exported["kwargs"]["intermediate_size"] = last - first
@@ -628,6 +746,7 @@ class GatedMLP(Module):
             )
 
         elif num_slices > 1:
+            assert unit == "slices"
             module = GatedMLP(
                 config = None,
                 **exported["kwargs"],

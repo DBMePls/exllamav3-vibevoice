@@ -1,4 +1,5 @@
 from .arcee import ArceeModel
+from .apertus import ApertusModel
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
@@ -19,6 +20,8 @@ from .phi3 import Phi3Model
 from .qwen2 import Qwen2Model
 from .qwen3 import Qwen3Model
 from .qwen3_moe import Qwen3MoeModel
+from .qwen3_next import Qwen3NextModel
+from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
 
 ARCHITECTURES = {
@@ -28,6 +31,7 @@ ARCHITECTURES = {
         "model_class": m,
     } for m in [
         ArceeModel,
+        ApertusModel,
         CohereModel,
         Cohere2Model,
         DeciLMModel,
@@ -49,6 +53,8 @@ ARCHITECTURES = {
         Qwen2Model,
         Qwen3Model,
         Qwen3MoeModel,
+        Qwen3NextModel,
+        SeedOssModel,
         SmolLM3Model,
     ]
 }

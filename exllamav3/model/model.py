@@ -18,7 +18,9 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.config = config
 
         self.modules = []
-        self.caps = {}
+        self.caps = {
+            "supports_tp": True
+        }
         self.active_devices = []
         self.output_device = None
 
@@ -30,22 +32,32 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Calibration options
         self.calibration_all_experts = False
 
+        # Modules dict
+        self.modules_dict = None
+
+        # Check compatibility
+        self.check_compat()
+
 
     def __iter__(self):
         for module in self.modules:
             yield from module
 
 
-    @lru_cache
     def find_module(self, key: str):
-        for module in self:
-            if module.key == key:
-                return module
+        if self.modules_dict is None:
+            self.modules_dict = {module.key: module for module in self}
+        return self.modules_dict[key]
 
 
     @lru_cache
     def get_cache_layers(self):
         return [m for m in self if m.caps.get("kv_cache")]
+
+
+    @lru_cache
+    def get_recurrent_layers(self):
+        return [m for m in self if m.caps.get("recurrent_cache")]
 
 
     @staticmethod
@@ -73,7 +85,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         # Overridden by model arch class
-        raise NotImplementedError
+        raise NotImplementedError()
 
 
     @torch.inference_mode
@@ -88,32 +100,44 @@ class Model(Model_TPMixin, Model_LSMixin):
 
 
     @torch.inference_mode
-    def forward(self,
-                input_ids: torch.Tensor | None,
-                params: dict | None = None,
-                inputs_embeds: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        params: dict | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
         if params is None:
             params = {}
 
         if input_ids is None and inputs_embeds is None:
-            raise ValueError("You must specify either input_ids or inputs_embeds")
+            raise ValueError("Must specify either input_ids or inputs_embeds")
 
-        # The `prepare_inputs` call is essential for setting up attention parameters.
-        # It needs a tensor with the correct batch_size and sequence_length for shape inference.
+        # prepare_inputs needs something shaped like tokens
         ref_ids = input_ids
         if ref_ids is None:
             ref_ids = torch.zeros(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
-
         _ = self.prepare_inputs(ref_ids, params)
 
         is_embeds = inputs_embeds is not None
         x = inputs_embeds if is_embeds else input_ids
 
+        # keep tensor-parallel path untouched unless extended later
         if self.loaded_tp:
-            # Note: forward_tp would require similar changes if you use tensor parallelism
-            return self.forward_tp(x, params, self.last_kv_module_idx, self.modules, is_embeds=is_embeds)
+            if is_embeds:
+                raise NotImplementedError(
+                    "inputs_embeds not yet supported in tensor-parallel mode; "
+                    "load in LS mode or extend Model_TPMixin."
+                )
+            out = self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
         else:
-            return self.forward_ls(x, params, self.last_kv_module_idx, self.modules, is_embeds=is_embeds)
+            out = self.forward_ls(x, params, self.last_kv_module_idx, self.modules, is_embeds=is_embeds)
+
+        # preserve old return type for input_ids, new tuple for inputs_embeds
+        if is_embeds:
+            return out  # expected (logits, last_hidden_state)
+        return out[0] if isinstance(out, tuple) else out
+
+
 
 
     def unload(self):
@@ -139,7 +163,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         generator: bool = True,
         tp_dev_limits: dict | None = None,
         tp_backend: str = "native",
-        verbose: bool = False
+        verbose: bool = False,
+        tp_options: dict | None = None,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -219,6 +244,10 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param verbose:
             bool, more info while loading including full TP split
+
+        :param tp_options:
+            dict of optional values:
+                "moe_tensor_split": bool - use tensor split rather than expert parallelism for MoE layers
         """
 
         free_mem()
@@ -292,11 +321,17 @@ class Model(Model_TPMixin, Model_LSMixin):
 
             # Tensor-P load:
             else:
+                if not self.caps.get("supports_tp"):
+                    raise NotImplementedError(f"Tensor-parallel is not currently implemented for {self.config.architecture}")
+
                 if tp_output_device is None:
                     tp_output_device = active_devices[0]
                 else:
                     assert torch.device(tp_output_device).index in active_devices, \
                         "Output device must be part of split."
+
+                if tp_options is None:
+                    tp_options = {}
 
                 yield from self._load_tp(
                     progressbar,
@@ -314,6 +349,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                     tp_dev_limits,
                     tp_backend,
                     verbose,
+                    tp_options,
                 )
                 self.output_device = tp_output_device
 
@@ -394,4 +430,15 @@ class Model(Model_TPMixin, Model_LSMixin):
         Convenience function for formatting a single chat request with the default template associated with the
         model's architecture, to simplify example and test scripts. Doesn't consider the model's actual Jinja template.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
+
+
+    def batch_recurrent_states(self):
+        raise NotImplementedError()
+
+
+    def check_compat(self):
+        """
+        Decide if any model-specific requirements are met when creating Model
+        """
+        pass

@@ -71,6 +71,11 @@ class Linear(Module):
             self.caps.update(caps)
 
 
+    @override
+    def optimizer_targets(self):
+        return [self.key]
+
+
     def pad_out(self, w: torch.Tensor | None) -> torch.Tensor | None:
         if w is None or self.out_features == self.out_features_unpadded and self.in_features == self.in_features_unpadded:
             return w
@@ -118,7 +123,8 @@ class Linear(Module):
                 self.full_out_features,
                 self.first_in_feature,
                 self.first_out_feature,
-                self.out_dtype
+                self.out_dtype,
+                key = self.key
             )
             if self.is_sliced:
                 self.inner.swap_device = self.device
@@ -146,7 +152,8 @@ class Linear(Module):
                 self.full_out_features,
                 self.first_in_feature,
                 self.first_out_feature,
-                out_dtype = self.out_dtype
+                out_dtype = self.out_dtype,
+                key = self.key
             )
             self.quant_type = "fp16"
             return True
@@ -185,7 +192,8 @@ class Linear(Module):
             mcg,
             mul1,
             bias,
-            self.out_dtype
+            self.out_dtype,
+            key = self.key
         )
         self.quant_type = "exl3"
         return True
@@ -210,6 +218,8 @@ class Linear(Module):
 
     @override
     def unload(self):
+        if self.inner is not None:
+            self.inner.unload()
         self.device = None
         self.inner = None
 
@@ -264,7 +274,8 @@ class Linear(Module):
             out_tensors.get("mcg"),
             out_tensors.get("mul1"),
             orig_bias,
-            self.out_dtype
+            self.out_dtype,
+            key = self.key
         )
 
         if return_weight_q:
@@ -349,7 +360,7 @@ class Linear(Module):
         return 2 * self.in_features * self.out_features
 
 
-    def make_tp_allocation(self) -> list[TPAllocation]:
+    def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         storage += self.storage_size()
         overhead_d = self.out_features * (self.out_dtype or torch.half).itemsize
@@ -409,6 +420,7 @@ class Linear(Module):
     @staticmethod
     def tp_import(local_context, exported, plan):
         key = exported["kwargs"]["key"]
-        first, last = plan[key] if key in plan else (None, None)
+        first, last, unit = plan[key] if key in plan else (None, None, "channels")
+        assert unit == "channels"
         split = (True, first, last) if first is not None else None
         return Linear.tp_import_split(local_context, exported, plan, split)
