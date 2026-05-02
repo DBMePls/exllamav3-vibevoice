@@ -19,7 +19,7 @@ Because this library relies on custom CUDA kernels for maximum performance, you 
 Clone this repository and install it locally:
 
 ```bash
-git clone https://github.com/DontBlameMep/exllamav3-vibevoice.git
+git clone https://github.com/DBMePls/exllamav3-vibevoice.git
 cd exllamav3-vibevoice
 
 # Install build requirements
@@ -43,6 +43,3 @@ This repository exists thanks to the incredible foundational work of the open-so
 
 * **[Turboderp](https://github.com/turboderp-org/exllamav3)** - For creating the original **ExLlamaV3** engine, a masterpiece of local LLM optimization.
 * **[Mozer](https://github.com/Mozer/exllamav3)** - For the brilliant engineering work to port and integrate VibeVoice compatibility into the EXL3 engine. You can also check out their ComfyUI implementation here: **[comfyUI-vibevoice-exl3](https://github.com/mozer/comfyUI-vibevoice-exl3)**.
-
----
-*Maintained by [DontBlameMep](https://github.com/DontBlameMep)*
