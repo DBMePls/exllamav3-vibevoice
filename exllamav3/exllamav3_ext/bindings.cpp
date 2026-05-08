@@ -1,8 +1,9 @@
 #include <cuda_fp16.h>
-
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+
+#include "vibevoice.h" // <--- We include our new header here
 
 #include "stloader.h"
 #include "hadamard.h"
@@ -130,4 +131,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
+    
+    py::class_<VibeVoiceDiffusionWorker>(m, "VibeVoiceDiffusionWorker")
+        .def(py::init<
+            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+            std::vector<at::Tensor>, std::vector<at::Tensor>, std::vector<at::Tensor>, 
+            std::vector<at::Tensor>, std::vector<at::Tensor>,
+            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+            at::Tensor, at::Tensor, at::Tensor, std::vector<int>, float
+        >())
+        .def("sample", &VibeVoiceDiffusionWorker::sample)
+        .def("acoustic_connector_forward", &VibeVoiceDiffusionWorker::acoustic_connector_forward);
 }
