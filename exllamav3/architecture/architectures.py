@@ -23,6 +23,7 @@ from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
 from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
+from .vibevoice import VibeVoiceModel # <--- Import VibeVoice
 
 ARCHITECTURES = {
     m.config_class.arch_string: {
@@ -56,6 +57,7 @@ ARCHITECTURES = {
         Qwen3NextModel,
         SeedOssModel,
         SmolLM3Model,
+        VibeVoiceModel # <--- Placed at the bottom, it overwrites Qwen2's map entry
     ]
 }
 

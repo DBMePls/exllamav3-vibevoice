@@ -3,11 +3,10 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "vibevoice.h" // <--- We include our new header here
+#include "vibevoice.h" 
 
 #include "stloader.h"
 #include "hadamard.h"
-
 #include "norm.cuh"
 #include "hgemm.cuh"
 #include "rope.cuh"
@@ -16,7 +15,6 @@
 #include "routing.cuh"
 #include "gdn.cuh"
 #include "causal_conv1d.cuh"
-
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"
 #include "quant/reconstruct.cuh"
@@ -25,16 +23,17 @@
 #include "quant/exl3_kernel_map.cuh"
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
-
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
 #include "generator/gumbel.cuh"
 #include "generator/rep_pen.cuh"
 #include "generator/cache.cuh"
-
 #include "cache/q_cache.cuh"
-
 #include "histogram.cuh"
+
+#ifdef MAX_DEVICES
+#undef MAX_DEVICES
+#endif
 
 #include "parallel/context.cuh"
 #include "parallel/broadcast.cuh"
@@ -42,6 +41,7 @@
 #include "parallel/gather.cuh"
 #include "parallel/all_reduce.cuh"
 
+// MUST BE INCLUDED BEFORE PYBIND11_MODULE
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/linear.h"
 #include "libtorch/gated_rmsnorm.h"
@@ -61,10 +61,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rms_norm", &rms_norm, "rms_norm");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
-
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
     m.def("routing_std", &routing_std, "routing_std");
-
     m.def("had_paley", &had_paley, "had_paley");
     m.def("had_paley2", &had_paley2, "had_paley2");
 
@@ -131,15 +129,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     #include "libtorch/gated_rmsnorm_bc.h"
     #include "libtorch/mlp_bc.h"
     #include "libtorch/blocksparse_mlp_bc.h"
-    
-    py::class_<VibeVoiceDiffusionWorker>(m, "VibeVoiceDiffusionWorker")
-        .def(py::init<
-            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-            std::vector<at::Tensor>, std::vector<at::Tensor>, std::vector<at::Tensor>, 
-            std::vector<at::Tensor>, std::vector<at::Tensor>,
-            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-            at::Tensor, at::Tensor, at::Tensor, std::vector<int>, float
-        >())
-        .def("sample", &VibeVoiceDiffusionWorker::sample)
-        .def("acoustic_connector_forward", &VibeVoiceDiffusionWorker::acoustic_connector_forward);
+
+    py::class_<VibeVoiceWorker>(m, "VibeVoiceWorker")
+        .def(py::init<std::map<std::string, at::Tensor>, std::vector<int>, at::Tensor, at::Tensor, at::Tensor, int, int, std::vector<int>>())
+        .def("sample_latent", &VibeVoiceWorker::sample_latent)
+        .def("decode_vae", &VibeVoiceWorker::decode_vae)
+        .def("encode_acoustic", &VibeVoiceWorker::encode_acoustic)
+        .def("acoustic_connector_forward", &VibeVoiceWorker::acoustic_connector_forward);
 }
